@@ -1,0 +1,5 @@
+fastapi
+typing-extensions
+opencv-python
+numpy
+backgroundremover

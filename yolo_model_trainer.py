@@ -3,10 +3,13 @@ from datetime import datetime
 import os
 import random
 import subprocess
+from subprocess import Popen
+from threading import Lock
 import video_frame_extractor
 import auto_labeler
 import shutil
 from status_manager import training_status
+
 
 split_ratio = {"train": 0.7, "valid": 0.2, "test": 0.1}
 
@@ -17,7 +20,9 @@ MAIN_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 bbox_test_dir = os.path.join(MAIN_OUTPUT_DIR, "bbox_test_images")
 os.makedirs(bbox_test_dir, exist_ok=True)
 
-
+# Dictionary to store active training processes
+training_processes = {}
+process_lock = Lock()  # Lock for thread-safe access to the dictionary
 
 # Function to create data.yml file
 def create_data_yml(output_dir: Path, class_name: str):
@@ -41,7 +46,8 @@ beltz-ai:
 # Function to run the model training
 def run_model_training(upload_dir: Path, class_name: str, training_status: dict):
     try:
-        # Set training status
+        
+        session_id = upload_dir.name
         training_status.update({
             "status": "Training",
             "session_id": upload_dir.name,
@@ -78,25 +84,33 @@ def run_model_training(upload_dir: Path, class_name: str, training_status: dict)
             "test": all_frames[train_count + valid_count:]
         }
 
-        # Save images and create YOLO labels
+        # Save images
         for split, frames in frame_splits.items():
             for frame, filename in frames:
                 video_frame_extractor.process_and_save_image(frame, filename, output_dirs[split])
-                original_image_path = output_dirs[split] / filename
-                auto_labeler.find_bounding_box_and_create_yolo_label(str(original_image_path), label_dirs[split])
 
-                # Process rotated images
-                for rotation in ['cw', 'ccw']:
-                    rotated_image_path = output_dirs[split] / f'{rotation}_{filename}'
-                    auto_labeler.find_bounding_box_and_create_yolo_label(str(rotated_image_path), label_dirs[split])
+        # Process all images and create YOLO labels
+        for split in frame_splits:
+            image_paths = [str(output_dirs[split] / f[1]) for f in frame_splits[split]]
+            auto_labeler.process_images_and_create_yolo_labels(image_paths, label_dirs[split], class_id=0)
 
         # Create data.yml file
         create_data_yml(main_output_dir, class_name)
 
         print(f"All videos processed. Dataset, labels, and labeled images saved in folder: {main_output_dir}")
 
-        # Train the YOLO model
-        train_yolo(main_output_dir, class_name, timestamp)
+        # Train the YOLO model and store the process
+        training_process = train_yolo(main_output_dir, class_name, timestamp)
+
+        # Store the process in the dictionary
+        with process_lock:
+            training_processes[session_id] = training_process
+
+        training_process.wait()  # Wait for the process to finish
+
+        # Remove the process from the dictionary once it finishes
+        with process_lock:
+            training_processes.pop(session_id, None)
 
         # Update status on success
         training_status.update({
@@ -109,6 +123,7 @@ def run_model_training(upload_dir: Path, class_name: str, training_status: dict)
             "status": "Error",
             "message": str(e)
         })
+
 
 def train_yolo(main_output_dir: Path, class_name: str, timestamp: str):
     data_yml_path = main_output_dir / "data.yml"
@@ -142,23 +157,35 @@ def train_yolo(main_output_dir: Path, class_name: str, timestamp: str):
         f"project={model_output_dir.resolve()}",  # Custom save path
         "name=" + class_name
     ]
-
-    try:
-        # Run the command and wait for it to finish
-        subprocess.run(command, check=True)
-        print("Training completed successfully.")
-        
-        # Copy the best.pt file to another folder
-        best_model_path = model_output_dir / class_name / "weights" / "best.pt"
-        if best_model_path.exists():
-            shutil.copy(best_model_path, additional_save_dir)
-            print(f"best.pt file copied to {additional_save_dir}")
-        else:
-            print("best.pt file not found in the default save location.")
-    except subprocess.CalledProcessError as e:
-        print(f"An error occurred during training: {e}")
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+    return Popen(command)
 
 async def get_training_status():
     return training_status
+
+def stop_training(session_id: str) -> str:
+    """
+    Stops an ongoing training process by its session ID.
+
+    Args:
+        session_id (str): The session ID of the training process to stop.
+
+    Returns:
+        str: A message indicating the process has been stopped.
+
+    Raises:
+        ValueError: If the session ID is not found.
+        RuntimeError: If an error occurs during termination.
+    """
+    with process_lock:
+        process = training_processes.get(session_id)
+
+    if not process:
+        raise ValueError(f"No training process found for session ID '{session_id}'.")
+
+    try:
+        process.terminate()  # Terminate the process
+        with process_lock:
+            training_processes.pop(session_id, None)  # Remove from the dictionary
+        return f"Training process with session ID '{session_id}' has been stopped successfully."
+    except Exception as e:
+        raise RuntimeError(f"Failed to stop training process: {e}")

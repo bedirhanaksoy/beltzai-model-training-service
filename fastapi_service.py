@@ -125,3 +125,20 @@ async def stop_training(session_id: str):
         raise HTTPException(status_code=404, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
+        
+@app.get("/model-folders/")
+async def get_model_folders():
+    """
+    Retrieves the names of folders in the trained_models directory.
+
+    Returns:
+        A list of folder names or an empty list if no folders exist.
+    """
+    try:
+        # Get the list of folders in the trained_models directory
+        folder_names = [
+            folder.name for folder in TRAINED_MODELS_DIR.iterdir() if folder.is_dir()
+        ]
+        return {"folders": folder_names}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
